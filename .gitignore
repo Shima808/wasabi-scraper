@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+maff_done_urls.txt
+maff_ingr_done_urls.txt
