@@ -6,8 +6,9 @@ https://www.maff.go.jp/j/keikaku/syokubunka/k_ryouri/search_menu/
   pip install requests beautifulsoup4 supabase python-dotenv
 
 使い方:
-  python scrape_maff.py                   # 通常スクレイプ（チェックポイント対応）
-  python scrape_maff.py --ingredients-only # 既存レシピの食材のみ再取得・再INSERT
+  python scrape_maff.py                      # 通常スクレイプ（チェックポイント対応）
+  python scrape_maff.py --ingredients-only   # 既存レシピの食材のみ再取得・再INSERT
+  python scrape_maff.py --instructions-only  # 既存レシピの作り方のみ再取得・UPDATE
 """
 
 import os
@@ -150,11 +151,11 @@ def parse_recipe_detail(url: str, prefecture_hint: str | None) -> dict | None:
     # 説明: 「歴史・由来・関連行事」セクションの本文（mainスコープ内で検索）
     description = _get_section_text(main, '歴史・由来・関連行事')
 
-    # 作り方: #main_content 内の <ul class="recipe"> > <li> > <div class="txt">
-    instructions_els = main.select('ul.recipe li div.txt')
+    # 作り方: div.inner > ul.recipe > li > div.txt
+    instructions_els = main.select('div.inner ul.recipe li div.txt')
     instructions_ja = '\n'.join(
-        el.get_text(strip=True) for el in instructions_els
-    ) if instructions_els else ''
+        el.get_text(strip=True) for el in instructions_els if el.get_text(strip=True)
+    )
 
     # 材料: #main_content 内の <ul class="menu_material"> > <li> > <ul class="list"> > <li>[0]=名前, [1]=分量
     ingredients_raw = []
@@ -354,6 +355,71 @@ def reingest_ingredients(supabase) -> None:
     log.info(f'完了: {success}/{len(pending)} 件のレシピに食材を INSERT')
 
 
+def reingest_instructions(supabase) -> None:
+    """
+    チェックポイントファイルのURLをもとに、既存レシピの instructions_ja を
+    再スクレイプして UPDATE する。
+    """
+    done_urls = load_checkpoint()
+    if not done_urls:
+        log.error(f'チェックポイントファイル "{CHECKPOINT_FILE}" が見つからないか空です。先に通常スクレイプを実行してください。')
+        return
+
+    urls = sorted(done_urls)
+    log.info(f'{len(urls)} 件のURLの作り方を再取得します')
+
+    success = 0
+    for i, url in enumerate(urls, 1):
+        log.info(f'[{i}/{len(urls)}] {url}')
+        time.sleep(SLEEP_SEC)
+
+        try:
+            soup = get_soup(url)
+        except Exception as e:
+            log.warning(f'ページ取得失敗 (スキップ): {url}: {e}')
+            continue
+
+        main = soup.select_one('#main_content')
+        if not main:
+            log.warning(f'#main_content なし (スキップ): {url}')
+            continue
+
+        h1 = main.find('h1')
+        title_ja = h1.get_text(strip=True) if h1 else None
+        if not title_ja:
+            log.warning(f'タイトル取得失敗 (スキップ): {url}')
+            continue
+
+        instructions_els = main.select('div.inner ul.recipe li div.txt')
+        instructions_ja = '\n'.join(
+            el.get_text(strip=True) for el in instructions_els if el.get_text(strip=True)
+        )
+
+        if not instructions_ja:
+            log.warning(f'作り方が取得できませんでした (スキップ): {title_ja}')
+            continue
+
+        try:
+            result = _execute_with_retry(
+                lambda t=title_ja, instr=instructions_ja: supabase.table('recipes')
+                    .update({'instructions_ja': instr})
+                    .eq('title_ja', t)
+                    .eq('source', 'maff')
+                    .execute()
+            )
+        except Exception as e:
+            log.warning(f'UPDATE失敗 (スキップ): {title_ja}: {e}')
+            continue
+
+        if result and result.data:
+            log.info(f'  → 更新完了: {title_ja}')
+            success += 1
+        else:
+            log.warning(f'  → 対象レシピが見つかりません: {title_ja}')
+
+    log.info(f'完了: {success}/{len(urls)} 件の作り方を UPDATE')
+
+
 def main():
     supabase_url = os.environ.get('SUPABASE_URL')
     supabase_key = os.environ.get('SUPABASE_SERVICE_KEY')
@@ -364,6 +430,10 @@ def main():
 
     if '--ingredients-only' in sys.argv:
         reingest_ingredients(supabase)
+        return
+
+    if '--instructions-only' in sys.argv:
+        reingest_instructions(supabase)
         return
 
     # Step 1: 都道府県一覧ページから各都道府県ページのリンクを取得
